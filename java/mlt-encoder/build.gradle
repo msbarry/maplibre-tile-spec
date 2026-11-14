@@ -1,0 +1,45 @@
+plugins {
+    id 'java-library'
+    alias(libs.plugins.diffplug.spotless)
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        url = 'https://maven.ecc.no/releases'
+    }
+}
+
+// The encoder has no dependencies, so applications can use it without pulling in mlt-core's.
+dependencies {
+    testImplementation project(':mlt-core')
+    testImplementation(libs.jts.core)
+    testImplementation(libs.junit.jupiter.api)
+    testImplementation(libs.junit.jupiter.params)
+    testRuntimeOnly(libs.junit.jupiter.engine)
+    testRuntimeOnly(libs.junit.jupiter.platform.launcher)
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+spotless {
+    java {
+        importOrder()
+        target 'src/*/java/**/*.java'
+        googleJavaFormat()
+        removeUnusedImports()
+    }
+}
+
+javadoc {
+    // Descriptions carry the contract, so don't require a tag for every parameter and return value.
+    options.addStringOption('Xdoclint:all,-missing', '-quiet')
+}
+
+test {
+    useJUnitPlatform()
+}
