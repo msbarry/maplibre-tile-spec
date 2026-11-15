@@ -42,7 +42,7 @@ final class IntegerStream {
   private int payloadBytes;
   private int runs;
 
-  /** The words to write as FastPFOR, or null to write VarInt words. */
+  /** The FastPFOR encoding to write, or null to write VarInt words. */
   private int[] fastPforWords;
 
   /**
@@ -102,12 +102,13 @@ final class IntegerStream {
     for (int i = 0; i < words.length; i++) {
       words[i] = (int) word(i, candidate.isDelta());
     }
-    int bytes = fastPfor.size(words, words.length);
+    int[] encoded = fastPfor.encode(words, words.length);
+    int bytes = 4 * encoded.length;
     if (streamSize(candidate, bytes, 0, words.length) < size()) {
       logical = candidate;
       payloadBytes = bytes;
       runs = 0;
-      fastPforWords = words;
+      fastPforWords = encoded;
     }
   }
 
@@ -123,7 +124,7 @@ final class IntegerStream {
     if (fastPforWords != null) {
       out.writeVarint(count);
       out.writeVarint(payloadBytes);
-      fastPfor.write(out, fastPforWords, count);
+      FastPfor.write(out, fastPforWords);
     } else if (logical.isRle()) {
       out.writeVarint(2L * runs);
       out.writeVarint(payloadBytes);

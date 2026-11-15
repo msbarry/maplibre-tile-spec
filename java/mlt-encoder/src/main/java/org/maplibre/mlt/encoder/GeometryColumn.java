@@ -221,12 +221,12 @@ final class GeometryColumn {
     int words = 2 * vertexCount;
     out.writeByte(VERTEX_STREAM);
     if (vertexWords != null && words >= FastPfor.MIN_VALUES) {
-      int fastPforBytes = codecs.fastPfor.size(vertexWords, words);
-      if (fastPforBytes < vertices.size()) {
+      int[] encoded = codecs.fastPfor.encode(vertexWords, words);
+      if (4 * encoded.length < vertices.size()) {
         out.writeByte(COMPONENTWISE_DELTA_FASTPFOR);
         out.writeVarint(words);
-        out.writeVarint(fastPforBytes);
-        codecs.fastPfor.write(out, vertexWords, words);
+        out.writeVarint(4 * encoded.length);
+        FastPfor.write(out, encoded);
         return;
       }
     }

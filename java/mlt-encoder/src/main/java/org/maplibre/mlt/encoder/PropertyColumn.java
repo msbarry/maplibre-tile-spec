@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import org.maplibre.mlt.converter.encodings.fsst.SymbolTable;
 
 /**
  * The values of one property key in a layer. The column type is picked from the values once the
@@ -169,22 +170,26 @@ final class PropertyColumn {
             + codesStream.size()
             + dataStreamSize(dictionary.size(), dictionaryBytes);
     IntegerStream symbolLengthsStream = null;
+    SymbolTable fsst = null;
     long fsstSize = Long.MAX_VALUE;
-    Fsst fsst = codecs.fsst;
-    if (fsst != null && dictionaryBytes >= MIN_FSST_BYTES) {
-      byte[] text = codecs.text((int) dictionaryBytes + Fsst.PADDING);
+    if (codecs.fsst != null && dictionaryBytes >= MIN_FSST_BYTES) {
+      byte[] text = new byte[(int) dictionaryBytes];
       int position = 0;
       for (byte[] utf8 : dictionary) {
         System.arraycopy(utf8, 0, text, position, utf8.length);
         position += utf8.length;
       }
-      fsst.compress(text, dictionaryLengths);
-      symbolLengthsStream = IntegerStream.of(fsst.trainedSymbolLengths, false, false, codecs);
+      fsst = codecs.fsst.encode(text);
+      LongList symbolLengths = codecs.longs(3);
+      for (int length : fsst.symbolLengths()) {
+        symbolLengths.add(length);
+      }
+      symbolLengthsStream = IntegerStream.of(symbolLengths, false, false, codecs);
       fsstSize =
           symbolLengthsStream.size()
-              + dataStreamSize(fsst.trainedSymbolLengths.size(), fsst.trainedSymbols.size())
+              + dataStreamSize(fsst.symbolLengths().length, fsst.symbols().length)
               + dictionaryLengthsStream.size()
-              + dataStreamSize(dictionary.size(), fsst.compressed.size())
+              + dataStreamSize(dictionary.size(), fsst.compressedData().length)
               + codesStream.size();
     }
 
@@ -195,11 +200,12 @@ final class PropertyColumn {
       }
       symbolLengthsStream.writeTo(data, SYMBOL_LENGTHS_STREAM);
       writePlainHeader(
-          data, SYMBOL_TABLE_STREAM, fsst.trainedSymbolLengths.size(), fsst.trainedSymbols.size());
-      data.writeBytes(fsst.trainedSymbols);
+          data, SYMBOL_TABLE_STREAM, fsst.symbolLengths().length, fsst.symbols().length);
+      data.writeBytes(fsst.symbols());
       dictionaryLengthsStream.writeTo(data, DICTIONARY_LENGTHS_STREAM);
-      writePlainHeader(data, DICTIONARY_DATA_STREAM, dictionary.size(), fsst.compressed.size());
-      data.writeBytes(fsst.compressed);
+      writePlainHeader(
+          data, DICTIONARY_DATA_STREAM, dictionary.size(), fsst.compressedData().length);
+      data.writeBytes(fsst.compressedData());
       codesStream.writeTo(data, STRING_CODES_STREAM);
     } else if (dictionarySize < plainSize) {
       data.writeVarint((nullable ? 1 : 0) + 3);

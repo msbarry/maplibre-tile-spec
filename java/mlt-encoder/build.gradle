@@ -10,9 +10,9 @@ repositories {
     }
 }
 
-// The encoder has no dependencies, so applications can use it without pulling in mlt-core's.
 dependencies {
-    testImplementation project(':mlt-core')
+    implementation project(':mlt-core')
+    implementation(libs.javaFastPFOR)
     testImplementation(libs.jts.core)
     testImplementation(libs.junit.jupiter.api)
     testImplementation(libs.junit.jupiter.params)

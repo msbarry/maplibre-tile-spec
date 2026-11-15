@@ -1,7 +1,6 @@
 package org.maplibre.mlt.encoder;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
@@ -13,31 +12,28 @@ import me.lemire.integercompression.VariableByte;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-/** Compares the encoder with JavaFastPFOR, whose output v1 decoders read. */
+/** Checks the encoding decodes with JavaFastPFOR and does not depend on earlier calls. */
 class FastPforTest {
 
   @ParameterizedTest
-  @ValueSource(ints = {1, 5, 255, 256, 257, 511, 512, 1000, 4096, 65535, 65536})
-  void sameBytesAsJavaFastPfor(int count) {
+  @ValueSource(ints = {1, 5, 255, 256, 257, 511, 512, 1000, 4096, 65535, 65536, 65537, 200_000})
+  void decodes(int count) {
     for (IntUnaryOperator generator : generators()) {
       int[] values = generate(count, generator);
-      byte[] expected = javaFastPfor(values);
-      byte[] actual = encode(values);
-      assertArrayEquals(expected, actual);
-      assertEquals(actual.length, new FastPfor().size(values, count));
+      assertArrayEquals(values, decode(encode(new FastPfor(), values), count));
     }
   }
 
   @ParameterizedTest
-  @ValueSource(ints = {65537, 140_000, 200_000})
-  void severalPagesDecode(int count) {
+  @ValueSource(ints = {300, 1000, 65537, 200_000})
+  void reusedEncoderWritesTheSameBytesAsANewOne(int count) {
+    var reused = new FastPfor();
+    for (IntUnaryOperator generator : generators()) {
+      encode(reused, generate(140_000, i -> generator.applyAsInt(i + 1) | 0x7FF));
+    }
     for (IntUnaryOperator generator : generators()) {
       int[] values = generate(count, generator);
-      byte[] encoded = encode(values);
-      assertEquals(encoded.length, new FastPfor().size(values, count));
-      // Bytes may differ from JavaFastPFOR in exception padding bits, which it fills with stale
-      // values from earlier pages, so compare what decodes instead.
-      assertArrayEquals(values, decode(encoded, count));
+      assertArrayEquals(encode(new FastPfor(), values), encode(reused, values));
     }
   }
 
@@ -70,21 +66,10 @@ class FastPforTest {
     return values;
   }
 
-  private static byte[] encode(int[] values) {
+  private static byte[] encode(FastPfor fastPfor, int[] values) {
     var out = new ByteWriter();
-    new FastPfor().write(out, values, values.length);
+    FastPfor.write(out, fastPfor.encode(values, values.length));
     return out.toByteArray();
-  }
-
-  /** What mlt-core's encoder writes: the Composition's ints, big-endian. */
-  private static byte[] javaFastPfor(int[] values) {
-    int[] compressed = new int[values.length * 2 + 1024];
-    var outPos = new IntWrapper(0);
-    new Composition(new FastPFOR(), new VariableByte())
-        .compress(values, new IntWrapper(0), values.length, compressed, outPos);
-    var buffer = ByteBuffer.allocate(outPos.get() * 4);
-    buffer.asIntBuffer().put(compressed, 0, outPos.get());
-    return buffer.array();
   }
 
   private static int[] decode(byte[] encoded, int count) {

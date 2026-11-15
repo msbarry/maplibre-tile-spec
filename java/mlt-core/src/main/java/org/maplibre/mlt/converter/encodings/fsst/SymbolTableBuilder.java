@@ -1,358 +1,422 @@
 /*
-MIT License
-
-Copyright (c) 2018-2020, CWI, TU Munich, FSU Jena
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+ * Adapted from the FSST reference implementation, https://github.com/cwida/fsst (MIT License,
+ * Copyright (c) 2018-2020, CWI, TU Munich, FSU Jena), described in Boncz, Neumann and Leis, "FSST:
+ * Fast Random Access String Compression" (VLDB 2020): the training (5 rounds counting symbols and
+ * symbol pairs, gains with single-byte symbols promoted 8 times, keeping the table of the best
+ * round), and the lookup of the longest symbol (a lossy hash table for symbols of 3 or more bytes,
+ * plus tables indexed by the first one or two bytes). Rewritten for Java with symbols as primitive
+ * longs, counters and lookup tables reused across calls and reset only where they were used, and one
+ * buffer compressed as a whole, as MLT stores it. Changed for the small inputs of a tile: the
+ * sample is the whole input up to 16 KB, every round trains on the whole sample (the reference
+ * grows the sample over the rounds) with a fixed minimum count, and when the sample is the whole
+ * input the last round keeps exactly the symbols that save more than they cost. The terminator byte and the code
+ * renumbering for decoding speed are left out.
  */
-
 package org.maplibre.mlt.converter.encodings.fsst;
 
-import com.carrotsearch.hppc.ByteArrayList;
-import java.nio.ByteBuffer;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteOrder;
 import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.PriorityQueue;
-import java.util.stream.IntStream;
-import org.jetbrains.annotations.NotNull;
 
 /**
- * Port of the FSST-encoding algorithm from <a
- * href="https://github.com/cwida/fsst">github.com/cwida/fsst</a>.
+ * FSST compression: trains a table of up to 255 symbols of 1 to 8 bytes on a buffer, then replaces
+ * the buffer's bytes with one-byte codes for those symbols, escaping bytes that no symbol covers.
  *
- * <p>Many of the C++ specific optimizations are excluded or replaced with the simpler python logic
- * described in <a
- * href="https://github.com/cwida/fsst/blob/master/fsstcompression.pdf">fsstcompression.pdf</a> to
- * improve readability.
- *
- * <p>Some Java-specific optimizations are added to bring performance within 50% of the C++ version
- * on real-world data.
+ * <p>An instance holds about 1.5 MB of tables that it reuses for each call, so reuse one per thread
+ * to compress many buffers. Instances are not thread-safe.
  */
-class SymbolTableBuilder {
-  static final int MAX_SYMBOL_LENGTH = 8;
-  private static final int NUM_ITERS = 6;
-  public static final int DEFAULT_SAMPLE_SIZE = 30_000;
-  private final int sampleSize;
-  private final Symbol[] symbols = new Symbol[512];
+public final class SymbolTableBuilder {
 
-  /** Index single-byte symbol in symbols array by their only byte. */
-  private final int[] sIndex = new int[256];
+  /** Bytes past the end of the input that the symbol lookup reads. */
+  private static final int PADDING = 8;
 
-  /** Index multi-byte symbols in symbols array by their first 2 bytes. */
-  private final int[] sIndexByFirst2 = new int[(1 << 16) + 1];
+  private static final VarHandle LONG_LE =
+      MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
+
+  private static final int MAX_SYMBOLS = 255;
+  private static final int ESCAPE = 255;
+
+  /** Codes below this are single bytes without a symbol, which compress to an escape. */
+  private static final int CODE_BASE = 256;
+
+  private static final int CODES = CODE_BASE + MAX_SYMBOLS;
+  private static final int HASH_SIZE = 1024;
+  private static final int ROUNDS = 5;
 
   /**
-   * Map from index in {@link #symbols} to a new index that sorts symbols by length ascending with
-   * single-byte symbols last
+   * Candidates seen fewer times are not worth a symbol, and leaving them out speeds training up.
    */
-  private int[] sIndexByLength;
+  private static final int MIN_COUNT = 5;
 
-  /** Map from index sorted by length to original index in {@link #symbols} */
-  private int[] sIndexByLengthReverse;
+  private static final int SAMPLE_BYTES = 16 * 1024;
+  private static final int SAMPLE_CHUNK = 512;
+  private static final long HASH_PRIME = 2971215073L;
+  private static final long[] MASKS = new long[9];
 
-  private int nSymbols;
-
-  private SymbolTableBuilder(int sampleSize) {
-    for (int code = 0; code < 256; code++) {
-      symbols[code] = Symbol.of(code);
+  static {
+    for (int length = 1; length < 8; length++) {
+      MASKS[length] = (1L << (8 * length)) - 1;
     }
-    this.sampleSize = sampleSize;
+    MASKS[8] = -1L;
   }
 
-  /** Builds a symbol table with up to a 30kb sample and compresses {@code data} with it. */
-  public static SymbolTable encode(byte[] data) {
-    var buf = ByteBuffer.wrap(data);
-    return buildSymbolTable(buf, DEFAULT_SAMPLE_SIZE).encode(buf);
+  // The symbol of each code: bytes little-endian in a long, and their count.
+  private final long[] symbolValues = new long[CODES];
+  private final int[] symbolLengths = new int[CODES];
+  private int symbolCount;
+
+  // Lookup of the longest symbol at a position. Unused entries hold -1, except byteCodes, which
+  // holds the byte itself (an escape) for bytes without a single-byte symbol.
+  private final int[] byteCodes = new int[256];
+  private final int[] shortCodes = new int[1 << 16];
+  private final int[] hashCodes = new int[HASH_SIZE];
+
+  // Training counters: of each code, and of each pair of codes that follow each other.
+  private final int[] counts = new int[CODES];
+  private final int[] pairCounts = new int[CODES * CODES];
+  private int[] countedPairs = new int[1024];
+  private int countedPairCount;
+
+  // Candidate symbols of the next table, deduplicated in an open-addressing table.
+  private long[] candidateValues = new long[1024];
+  private int[] candidateLengths = new int[1024];
+  private long[] candidateGains = new long[1024];
+  private int[] candidateSlots = new int[512];
+  private int candidateCount;
+  private long[] order = new long[512];
+
+  // The table of the best round and its counts.
+  private final long[] bestValues = new long[CODES];
+  private final int[] bestLengths = new int[CODES];
+  private final int[] bestCounts = new int[CODES];
+  private int bestSymbolCount;
+
+  /** Start and end of each line of the training sample. */
+  private final int[] sampleLines = new int[2 * SAMPLE_BYTES / SAMPLE_CHUNK];
+
+  private int sampleLineCount;
+
+  /** Whether the sample is the whole text, so the last round counts every symbol use. */
+  private boolean sampledAll;
+
+  /** The input, followed by {@link #PADDING} bytes. */
+  private byte[] text = new byte[1024];
+
+  private byte[] compressed = new byte[1024];
+
+  /** Creates a builder, allocating its tables. */
+  public SymbolTableBuilder() {
+    for (int b = 0; b < CODE_BASE; b++) {
+      symbolValues[b] = b;
+      symbolLengths[b] = 1;
+      byteCodes[b] = b;
+    }
+    Arrays.fill(shortCodes, -1);
+    Arrays.fill(hashCodes, -1);
   }
 
-  public static SymbolTableBuilder buildSymbolTable(ByteBuffer data, int sampleSize) {
-    // main loop: init symbol table with single-byte symbols...
-    SymbolTableBuilder st = new SymbolTableBuilder(sampleSize);
-    SymbolTableBuilder bestTable = st;
-    long bestWeight = Long.MAX_VALUE;
-    Counters counters;
-    Counters bestCounters = null;
-    for (int i = 1; i <= NUM_ITERS; i++) {
-      // then gather statistics about symbol frequencies and encoded data size
-      counters = new Counters();
-      long weight = st.compressCount(counters, data, i < NUM_ITERS);
-      if (weight <= bestWeight) {
-        bestCounters = counters;
-        bestTable = st;
-        bestWeight = weight;
+  /** Trains a symbol table on {@code data} and compresses {@code data} with it as one buffer. */
+  public SymbolTable encode(byte[] data) {
+    int length = data.length;
+    if (text.length < length + PADDING) {
+      text = new byte[Math.max(length + PADDING, 2 * text.length)];
+    }
+    System.arraycopy(data, 0, text, 0, length);
+    chooseSample(length);
+    train(text);
+
+    int[] trainedLengths = Arrays.copyOfRange(symbolLengths, CODE_BASE, CODE_BASE + symbolCount);
+    byte[] symbols = new byte[Arrays.stream(trainedLengths).sum()];
+    int symbolBytes = 0;
+    for (int code = CODE_BASE; code < CODE_BASE + symbolCount; code++) {
+      for (int i = 0; i < symbolLengths[code]; i++) {
+        symbols[symbolBytes++] = (byte) (symbolValues[code] >>> (8 * i));
       }
-      // and iteratively combine symbols and return the best one
-      if (i < NUM_ITERS) st = st.makeTable(counters, false, sampleSize < data.capacity());
     }
 
-    var result = bestTable.makeTable(bestCounters, true, sampleSize < data.capacity());
-    return result.sortSymbolsByLength();
-  }
-
-  private SymbolTableBuilder sortSymbolsByLength() {
-    // sort symbols by length ascending, with length 1 symbols last
-    sIndexByLength = new int[nSymbols];
-    sIndexByLengthReverse = new int[nSymbols];
-    int idx = 0;
-    // 2, 3, 4, 5, 6, 7, 8, 1
-    for (int b = 2; b <= MAX_SYMBOL_LENGTH + 1; b++) {
-      int len = b > MAX_SYMBOL_LENGTH ? 1 : b;
-      for (int i = 0; i < nSymbols; i++) {
-        var symbol = symbols[256 + i];
-        if (symbol.length() == len) {
-          int j = idx++;
-          sIndexByLength[i] = j;
-          sIndexByLengthReverse[j] = i;
-        }
-      }
+    // Each input byte compresses to at most an escape and the byte.
+    if (compressed.length < 2 * length) {
+      compressed = new byte[Math.max(2 * length, 2 * compressed.length)];
     }
-    return this;
-  }
-
-  private SymbolTable encode(ByteBuffer text) {
-    var encodedSymbols = new ByteArrayList();
-    int[] lengths = new int[nSymbols];
-    for (int i = 0; i < nSymbols; i++) {
-      var symbol = this.symbols[256 + sIndexByLengthReverse[i]];
-      lengths[i] = symbol.length();
-      encodedSymbols.add(symbol.bytes());
-    }
-    byte[] encodedText = encodeText(text, lengths);
-
-    return new SymbolTable(encodedSymbols.toArray(), lengths, encodedText, text.capacity());
-  }
-
-  private byte[] encodeText(ByteBuffer text, int[] lens) {
-    int cap = text.capacity();
-    var encoded = new ByteArrayList(cap);
-    for (int i = 0; i < cap; ) {
-      int code = findLongestSymbol(text, i);
-      if (isEscapeCode(code)) {
-        encoded.add((byte) 255, text.get(i++));
+    int compressedLength = 0;
+    int position = 0;
+    while (position < length) {
+      int code = longestSymbol(text, position, length);
+      if (code < CODE_BASE) {
+        compressed[compressedLength++] = (byte) ESCAPE;
+        compressed[compressedLength++] = (byte) code;
+        position++;
       } else {
-        int symbol = sIndexByLength[code - 256];
-        encoded.add((byte) symbol);
-        i += lens[symbol];
+        compressed[compressedLength++] = (byte) (code - CODE_BASE);
+        position += symbolLengths[code];
       }
     }
-    return encoded.toArray();
+    return new SymbolTable(
+        symbols, trainedLengths, Arrays.copyOf(compressed, compressedLength), length);
   }
 
-  private static boolean isEscapeCode(int code) {
-    return code < 256;
-  }
-
-  private static void addOrInc(Map<Symbol, Long> cands, Symbol s, long count, int min) {
-    if (count >= min) {
-      long gain = count * s.length();
-      cands.merge(s, gain, Long::sum);
-    }
-  }
-
-  private void add(Symbol symbol) {
-    symbols[256 + (nSymbols++)] = symbol;
-  }
-
-  private int findLongestSymbol(ByteBuffer text, int offset) {
-    // first look for a multi-byte symbol starting with the next 2 bytes
-    if (text.capacity() - offset >= 2) {
-      int a = text.getShort(offset) & 0xFFFF;
-      int start = sIndexByFirst2[a];
-      if (start > 0) {
-        int end = sIndexByFirst2[a + 1];
-        for (int code = start; code < end; code++) {
-          if (symbols[code].match(text, offset, 2)) {
-            return code;
-          }
-        }
+  private void train(byte[] text) {
+    clearTable();
+    clearCounts();
+    long bestGain = Long.MIN_VALUE;
+    for (int round = 1; ; round++) {
+      boolean lastRound = round == ROUNDS;
+      long gain = countSymbols(text, !lastRound);
+      if (gain >= bestGain) {
+        bestGain = gain;
+        saveBest();
       }
+      if (lastRound) {
+        break;
+      }
+      makeTable(false);
+      clearCounts();
     }
-
-    // if not found, then look for a single-byte symbol
-    var letter = text.get(offset) & 0xFF;
-    int code = sIndex[letter];
-
-    if (!isEscapeCode(code)) {
-      return code;
-    }
-
-    // otherwise just return the "escape code" for this symbol since it's not in the table
-    return letter;
+    clearCounts();
+    restoreBest();
+    makeTable(true);
   }
 
-  record Range(int start, int end) {}
-
-  private List<Range> ranges(int size) {
-    if (size < sampleSize) {
-      return List.of(new Range(0, size));
+  /**
+   * Picks the lines to train on: the whole text when it is at most 16 KB, otherwise 16 KB of
+   * 512-byte chunks evenly spread over it, as the reference does.
+   */
+  private void chooseSample(int length) {
+    sampleLineCount = 0;
+    sampledAll = length <= SAMPLE_BYTES;
+    if (sampledAll) {
+      if (length > 0) {
+        addSampleLine(0, length);
+      }
     } else {
-      int chunkSize = 1000;
-      int samples = sampleSize / chunkSize;
-      int offset = size / (samples);
-      return IntStream.range(0, samples)
-          .mapToObj(i -> new Range(i * offset, Math.min(size, i * offset + chunkSize)))
-          .toList();
+      int chunks = SAMPLE_BYTES / SAMPLE_CHUNK;
+      for (int i = 0; i < chunks; i++) {
+        int start = (int) ((long) i * (length - SAMPLE_CHUNK) / (chunks - 1));
+        addSampleLine(start, start + SAMPLE_CHUNK);
+      }
     }
   }
 
-  private long compressCount(Counters counters, ByteBuffer text, boolean secondPass) {
-    if (text.capacity() == 0) return 0;
-    long weight = 0;
+  private void addSampleLine(int start, int end) {
+    sampleLines[2 * sampleLineCount] = start;
+    sampleLines[2 * sampleLineCount + 1] = end;
+    sampleLineCount++;
+  }
 
-    for (var range : ranges(text.capacity())) {
-      int start = range.start;
-      int end = range.end;
-      int code2;
-      int code1 = findLongestSymbol(text, start);
-      Symbol symbol = symbols[code1];
-      int cur = start + symbol.length();
-      start = cur;
-      weight += isEscapeCode(code1) ? 2 : 1;
-      while (cur < end) {
-        // count single symbol (i.e. an option is not extending it)
-        counters.count1Inc(code1);
-        // as an alternative, consider just using the next byte..
-        if (symbol.length() > 1) { // .. but do not count single byte symbols doubly
-          counters.count1Inc(text.get(start) & 0xFF);
+  /**
+   * Compresses the sample lines with the current table, counting each code and (with {@code
+   * countPairs}) each pair of consecutive codes, and returns the bytes saved.
+   */
+  private long countSymbols(byte[] text, boolean countPairs) {
+    long gain = 0;
+    for (int line = 0; line < sampleLineCount; line++) {
+      int start1 = sampleLines[2 * line];
+      int end = sampleLines[2 * line + 1];
+      int code1 = longestSymbol(text, start1, end);
+      int position = start1 + symbolLengths[code1];
+      gain += symbolLengths[code1] - (code1 < CODE_BASE ? 2 : 1);
+      while (true) {
+        counts[code1]++;
+        // Also count the first byte alone, as a shorter alternative to the symbol.
+        if (symbolLengths[code1] != 1) {
+          counts[text[start1] & 0xFF]++;
         }
-
-        // now match a new symbol
-        start = cur;
-        code2 = findLongestSymbol(text, cur);
-        Symbol symbol2 = symbols[code2];
-        cur += symbol2.length();
-        weight += isEscapeCode(code2) ? 2 : 1;
-        if (secondPass) { // no need to count pairs in final round
-          // consider the symbol that is the concatenation of the two last symbols
-          counters.count2Inc(code1, code2);
-          // as an alternative, consider just extending with the next byte..
-          if (symbol2.length() > 1) { // ..but do not count single byte extensions doubly
-            counters.count2Inc(code1, text.get(start) & 0xFF);
+        if (position == end) {
+          break;
+        }
+        int start2 = position;
+        int code2 = longestSymbol(text, position, end);
+        position += symbolLengths[code2];
+        gain += symbolLengths[code2] - (code2 < CODE_BASE ? 2 : 1);
+        if (countPairs) {
+          countPair(code1, code2);
+          if (symbolLengths[code2] != 1) {
+            countPair(code1, text[start2] & 0xFF);
           }
         }
         code1 = code2;
-        symbol = symbols[code1];
+        start1 = start2;
       }
     }
-    // account for the encoded symbol table size
-    for (int i = 0; i < nSymbols; i++) {
-      weight += symbols[256 + i].length() + 1;
-    }
-    return weight;
+    return gain;
   }
 
-  private SymbolTableBuilder makeTable(Counters counters, boolean lastPass, boolean sampled) {
-    int minCount = 5;
-    // hashmap of c (needed because we can generate duplicate candidates)
-    Map<Symbol, Long> cands = new HashMap<>();
-    int max = 256 + nSymbols;
-    for (int pos1 = 0; pos1 < max; pos1++) {
-      int cnt1 = counters.count1GetNext(pos1);
-      if (cnt1 <= 0) continue;
-      Symbol s1 = symbols[pos1];
-      // note from C++ implementation:
-      // heuristic: promoting single-byte symbols (*8) helps reduce exception rates and increases
-      // [de]compression speed
-      addOrInc(
-          cands, s1, (s1.length() == 1 ? 8L : 1L) * cnt1, (lastPass && !sampled) ? 1 : minCount);
+  private void countPair(int code1, int code2) {
+    int index = code1 * CODES + code2;
+    if (pairCounts[index]++ == 0) {
+      if (countedPairCount == countedPairs.length) {
+        countedPairs = Arrays.copyOf(countedPairs, countedPairCount * 2);
+      }
+      countedPairs[countedPairCount++] = index;
+    }
+  }
 
-      // don't need pair-wise counts for last pass to just encode the data
-      if (lastPass || s1.length() == MAX_SYMBOL_LENGTH) continue;
-      for (int pos2 = 0; pos2 < max; pos2++) {
-        int cnt2 = counters.count2GetNext(pos1, pos2);
-        if (cnt2 < minCount) continue;
-        addOrInc(cands, Symbol.concat(s1, symbols[pos2]), cnt2, minCount);
+  /**
+   * Replaces the table with the 255 candidates of highest gain: each counted symbol, and unless
+   * {@code lastRound}, each concatenation of a counted pair.
+   */
+  private void makeTable(boolean lastRound) {
+    clearCandidates(CODE_BASE + symbolCount + (lastRound ? 0 : countedPairCount));
+    for (int code = 0; code < CODE_BASE + symbolCount; code++) {
+      int length = symbolLengths[code];
+      if (counts[code] > 0) {
+        if (lastRound && sampledAll) {
+          // The counts are exact, so keep exactly the symbols that save more than they cost: each
+          // use saves its bytes but one (or an escape byte for a single byte), and storing one
+          // costs its bytes plus its length.
+          long saved = (long) counts[code] * (length == 1 ? 1 : length - 1);
+          if (saved <= length + 1) {
+            continue;
+          }
+        }
+        // Single-byte symbols are promoted, as the reference does, to reduce escapes.
+        long count = (length == 1 ? 8L : 1L) * counts[code];
+        addCandidate(symbolValues[code], length, count, lastRound && sampledAll ? 0 : MIN_COUNT);
       }
     }
-
-    PriorityQueue<QSymbol> pq = new PriorityQueue<>();
-    for (var entry : cands.entrySet()) {
-      pq.add(new QSymbol(entry.getValue(), entry.getKey()));
-    }
-    SymbolTableBuilder st = new SymbolTableBuilder(sampleSize);
-    while (st.nSymbols < 255 && !pq.isEmpty()) {
-      var symb = pq.remove();
-      if (!lastPass || sampled) {
-        st.add(symb.symbol);
-      } else {
-        // adding a symbol costs length + 1, so don't add if it costs more than it saves
-        long costs = symb.symbol.length() + 1L;
-        long saves = symb.symbol.length() == 1 ? symb.gain / 8 : symb.gain;
-        if (saves > costs) {
-          st.add(symb.symbol);
+    if (!lastRound) {
+      for (int i = 0; i < countedPairCount; i++) {
+        int code1 = countedPairs[i] / CODES;
+        int code2 = countedPairs[i] % CODES;
+        int length1 = symbolLengths[code1];
+        if (length1 < 8) {
+          int length = Math.min(8, length1 + symbolLengths[code2]);
+          long value =
+              (symbolValues[code1] | (symbolValues[code2] << (8 * length1))) & MASKS[length];
+          addCandidate(value, length, pairCounts[countedPairs[i]], MIN_COUNT);
         }
       }
     }
 
-    return st.finish();
+    // Highest gain first, ties in the order the candidates were found.
+    if (order.length < candidateCount) {
+      order = new long[candidateSlots.length];
+    }
+    for (int i = 0; i < candidateCount; i++) {
+      order[i] = (candidateGains[candidateSlots[i]] << 24) | (0xFFFFFF - i);
+    }
+    Arrays.sort(order, 0, candidateCount);
+    clearTable();
+    for (int i = candidateCount - 1; i >= 0 && symbolCount < MAX_SYMBOLS; i--) {
+      int slot = candidateSlots[0xFFFFFF - (int) (order[i] & 0xFFFFFF)];
+      addSymbol(candidateValues[slot], candidateLengths[slot]);
+    }
   }
 
-  public SymbolTableBuilder finish() {
-    Symbol[] tmp = Arrays.copyOfRange(symbols, 256, 256 + nSymbols);
-    Arrays.sort(tmp); // sorts prefix symbols after the longer symbols
-    for (int i = nSymbols - 1; i >= 0; i--) {
-      int letter = tmp[i].first();
-      // index multi-byte by their first 2 bytes
-      if (tmp[i].length() >= 2) {
-        var bytes = tmp[i].bytes();
-        int val = ((bytes[0] & 0xFF) << 8) | (bytes[1] & 0xFF);
-        sIndexByFirst2[val] = 256 + i;
-        // there might be symbols with this prefix, so store end of the range by setting val+1
-        if (sIndexByFirst2[val + 1] == 0) {
-          sIndexByFirst2[val + 1] = 256 + i + 1;
-        }
-      } else {
-        // index single-byte symbols by their only byte
-        sIndex[letter] = 256 + i;
+  private void addCandidate(long value, int length, long count, int minCount) {
+    if (count < minCount) {
+      return;
+    }
+    int mask = candidateLengths.length - 1;
+    int slot = (int) hash(value * 9 + length) & mask;
+    while (candidateLengths[slot] != 0
+        && (candidateValues[slot] != value || candidateLengths[slot] != length)) {
+      slot = (slot + 1) & mask;
+    }
+    if (candidateLengths[slot] == 0) {
+      candidateValues[slot] = value;
+      candidateLengths[slot] = length;
+      candidateGains[slot] = 0;
+      candidateSlots[candidateCount++] = slot;
+    }
+    candidateGains[slot] += count * length;
+  }
+
+  private void clearCandidates(int maxCandidates) {
+    for (int i = 0; i < candidateCount; i++) {
+      candidateLengths[candidateSlots[i]] = 0;
+    }
+    candidateCount = 0;
+    if (candidateLengths.length < 2 * maxCandidates) {
+      int capacity = Integer.highestOneBit(4 * maxCandidates - 1);
+      candidateValues = new long[capacity];
+      candidateLengths = new int[capacity];
+      candidateGains = new long[capacity];
+      candidateSlots = new int[capacity];
+    }
+  }
+
+  /** Adds a symbol unless it is 3 bytes or more and its hash slot is taken. */
+  private void addSymbol(long value, int length) {
+    int code = CODE_BASE + symbolCount;
+    if (length == 1) {
+      byteCodes[(int) value] = code;
+    } else if (length == 2) {
+      shortCodes[(int) value] = code;
+    } else {
+      int slot = hashSlot(value);
+      if (hashCodes[slot] >= 0) {
+        return;
       }
-      symbols[256 + i] = tmp[i];
+      hashCodes[slot] = code;
     }
-    return this;
+    symbolValues[code] = value;
+    symbolLengths[code] = length;
+    symbolCount++;
   }
 
-  private record QSymbol(long gain, Symbol symbol) implements Comparable<QSymbol> {
-    @Override
-    public int compareTo(@NotNull SymbolTableBuilder.QSymbol o) {
-      return Long.compare(o.gain, gain);
+  /** Returns the code of the longest symbol at {@code position}, or its byte if there is none. */
+  private int longestSymbol(byte[] text, int position, int end) {
+    long word = (long) LONG_LE.get(text, position);
+    int remaining = end - position;
+    int code = hashCodes[hashSlot(word)];
+    if (code >= 0) {
+      int length = symbolLengths[code];
+      if (length <= remaining && (word & MASKS[length]) == symbolValues[code]) {
+        return code;
+      }
     }
+    if (remaining >= 2) {
+      code = shortCodes[(int) word & 0xFFFF];
+      if (code >= 0) {
+        return code;
+      }
+    }
+    return byteCodes[(int) word & 0xFF];
   }
 
-  static class Counters {
-    private final int[] count1 = new int[512];
-    private final int[] count2 = new int[512 * 512];
+  private static int hashSlot(long word) {
+    return (int) hash(word & 0xFFFFFF) & (HASH_SIZE - 1);
+  }
 
-    public void count1Inc(int pos1) {
-      count1[pos1]++;
-    }
+  private static long hash(long value) {
+    long product = value * HASH_PRIME;
+    return product ^ (product >>> 15);
+  }
 
-    public void count2Inc(int pos1, int pos2) {
-      count2[(pos1 << 9) | pos2]++;
+  private void clearTable() {
+    for (int code = CODE_BASE; code < CODE_BASE + symbolCount; code++) {
+      long value = symbolValues[code];
+      switch (symbolLengths[code]) {
+        case 1 -> byteCodes[(int) value] = (int) value;
+        case 2 -> shortCodes[(int) value] = -1;
+        default -> hashCodes[hashSlot(value)] = -1;
+      }
     }
+    symbolCount = 0;
+  }
 
-    public int count1GetNext(int pos1) {
-      return count1[pos1];
+  private void clearCounts() {
+    Arrays.fill(counts, 0);
+    for (int i = 0; i < countedPairCount; i++) {
+      pairCounts[countedPairs[i]] = 0;
     }
+    countedPairCount = 0;
+  }
 
-    public int count2GetNext(int pos1, int pos2) {
-      return count2[(pos1 << 9) | pos2];
+  private void saveBest() {
+    bestSymbolCount = symbolCount;
+    System.arraycopy(symbolValues, CODE_BASE, bestValues, CODE_BASE, symbolCount);
+    System.arraycopy(symbolLengths, CODE_BASE, bestLengths, CODE_BASE, symbolCount);
+    System.arraycopy(counts, 0, bestCounts, 0, CODES);
+  }
+
+  private void restoreBest() {
+    clearTable();
+    for (int code = CODE_BASE; code < CODE_BASE + bestSymbolCount; code++) {
+      addSymbol(bestValues[code], bestLengths[code]);
     }
+    System.arraycopy(bestCounts, 0, counts, 0, CODES);
   }
 }

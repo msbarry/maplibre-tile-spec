@@ -4,6 +4,6 @@ class FsstJava implements Fsst {
 
   @Override
   public SymbolTable encode(byte[] data) {
-    return SymbolTableBuilder.encode(data);
+    return new SymbolTableBuilder().encode(data);
   }
 }

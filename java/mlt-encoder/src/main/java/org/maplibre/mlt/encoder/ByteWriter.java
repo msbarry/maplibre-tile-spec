@@ -63,17 +63,6 @@ final class ByteWriter {
     size += 4;
   }
 
-  /** Makes room for {@code extra} more bytes, for the unchecked writes. */
-  void reserve(int extra) {
-    ensureCapacity(extra);
-  }
-
-  /** Writes a big-endian int into room made with {@link #reserve}. */
-  void writeIntBEUnchecked(int value) {
-    INT_BE.set(bytes, size, value);
-    size += 4;
-  }
-
   int getIntLE(int offset) {
     return (int) INT_LE.get(bytes, offset);
   }
