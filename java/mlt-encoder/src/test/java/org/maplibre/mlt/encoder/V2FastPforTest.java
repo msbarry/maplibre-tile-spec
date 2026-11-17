@@ -2,38 +2,41 @@ package org.maplibre.mlt.encoder;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 
-import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.function.IntUnaryOperator;
 import me.lemire.integercompression.Composition;
-import me.lemire.integercompression.FastPFOR;
+import me.lemire.integercompression.FastPFOR128;
 import me.lemire.integercompression.IntWrapper;
 import me.lemire.integercompression.VariableByte;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-/** Checks the encoding decodes with JavaFastPFOR and does not depend on earlier calls. */
-class FastPforTest {
+/**
+ * Checks the encoding decodes with JavaFastPFOR's 128-value codec, which lays blocks and exceptions
+ * out the way the Rust reference decoder reads MLT v2 FastPFOR, and does not depend on earlier
+ * calls.
+ */
+class V2FastPforTest {
 
   @ParameterizedTest
-  @ValueSource(ints = {1, 5, 255, 256, 257, 511, 512, 1000, 4096, 65535, 65536, 65537, 200_000})
+  @ValueSource(ints = {128, 129, 255, 256, 1000, 4096, 65535, 65536, 65537, 200_000})
   void decodes(int count) {
     for (IntUnaryOperator generator : generators()) {
       int[] values = generate(count, generator);
-      assertArrayEquals(values, decode(encode(new FastPfor(), values), count));
+      assertArrayEquals(values, decode(encode(new V2FastPfor(), values), count));
     }
   }
 
   @ParameterizedTest
-  @ValueSource(ints = {300, 1000, 65537, 200_000})
-  void reusedEncoderWritesTheSameBytesAsANewOne(int count) {
-    var reused = new FastPfor();
+  @ValueSource(ints = {300, 65537})
+  void reusedEncoderWritesTheSameWordsAsANewOne(int count) {
+    var reused = new V2FastPfor();
     for (IntUnaryOperator generator : generators()) {
       encode(reused, generate(140_000, i -> generator.applyAsInt(i + 1) | 0x7FF));
     }
     for (IntUnaryOperator generator : generators()) {
       int[] values = generate(count, generator);
-      assertArrayEquals(encode(new FastPfor(), values), encode(reused, values));
+      assertArrayEquals(encode(new V2FastPfor(), values), encode(reused, values));
     }
   }
 
@@ -66,19 +69,16 @@ class FastPforTest {
     return values;
   }
 
-  private static byte[] encode(FastPfor fastPfor, int[] values) {
-    var out = new ByteWriter();
-    FastPfor.write(out, fastPfor.encode(values, values.length));
-    return out.toByteArray();
+  private static int[] encode(V2FastPfor fastPfor, int[] values) {
+    IntList words = fastPfor.encode(values, values.length);
+    return Arrays.copyOf(words.array(), words.size());
   }
 
-  private static int[] decode(byte[] encoded, int count) {
-    int[] ints = new int[encoded.length / 4];
-    ByteBuffer.wrap(encoded).asIntBuffer().get(ints);
+  private static int[] decode(int[] words, int count) {
     int[] decoded = new int[count + 1024];
     var outPos = new IntWrapper(0);
-    new Composition(new FastPFOR(), new VariableByte())
-        .uncompress(ints, new IntWrapper(0), ints.length, decoded, outPos);
+    new Composition(new FastPFOR128(), new VariableByte())
+        .uncompress(words, new IntWrapper(0), words.length, decoded, outPos);
     return Arrays.copyOf(decoded, outPos.get());
   }
 }

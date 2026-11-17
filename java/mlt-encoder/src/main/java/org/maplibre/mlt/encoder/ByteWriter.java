@@ -8,6 +8,10 @@ import java.util.Arrays;
 /** A growable byte buffer with the primitives MLT is written with, reused across tiles. */
 final class ByteWriter {
 
+  // Views of the byte array as ints / longs in a fixed byte order, at any byte offset. The JIT
+  // turns each get / set into one load or store (plus a byte swap if the CPU's order differs),
+  // instead of 4 or 8 single-byte writes with shifts. MLT needs both orders: FastPFOR words are
+  // big-endian in v1, float / double values are little-endian.
   private static final VarHandle INT_LE =
       MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
   private static final VarHandle INT_BE =
@@ -97,9 +101,14 @@ final class ByteWriter {
     return Arrays.copyOf(bytes, size);
   }
 
+  // Kept tiny so the JIT inlines it into every write, with the rare copy out of line.
   private void ensureCapacity(int extra) {
     if (size + extra > bytes.length) {
-      bytes = Arrays.copyOf(bytes, Math.max(bytes.length * 2, size + extra));
+      grow(extra);
     }
+  }
+
+  private void grow(int extra) {
+    bytes = Arrays.copyOf(bytes, Math.max(bytes.length * 2, size + extra));
   }
 }

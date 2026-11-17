@@ -9,11 +9,11 @@ import me.lemire.integercompression.IntegerCODEC;
 import me.lemire.integercompression.VariableByte;
 
 /**
- * The v1 SIMD-FastPFOR physical encoding of 32-bit words: JavaFastPFOR's {@code
+ * The MLT v1 FastPFOR physical encoding of 32-bit words: JavaFastPFOR's {@code
  * Composition(FastPFOR, VariableByte)} output, with every 32-bit word stored big-endian. Not
  * thread-safe: the codec holds scratch arrays.
  */
-final class FastPfor {
+final class V1FastPfor {
 
   /** Below this many values there is no whole block, so VarInt words are always smaller. */
   static final int MIN_VALUES = 256;

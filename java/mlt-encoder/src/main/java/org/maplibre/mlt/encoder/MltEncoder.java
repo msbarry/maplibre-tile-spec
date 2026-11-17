@@ -1,16 +1,16 @@
 package org.maplibre.mlt.encoder;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.Objects;
+import org.locationtech.jts.geom.Geometry;
 
 /**
- * Encodes vector tiles to MLT v1, one layer and feature at a time, from MVT geometry commands.
+ * Encodes vector tiles to MLT, one layer and feature at a time, from MVT geometry commands or JTS
+ * geometries.
  *
  * {@snippet :
- * var encoder = new MltEncoder();
+ * var encoder = MltEncoder.builder().fastPfor(true).fsst(true).build();
  * encoder.beginLayer("pois", 4096);
  * int name = encoder.propertyKey("name");
  * encoder.addFeature(MvtGeometryType.POINT, mvtCommands, 1);
@@ -21,85 +21,82 @@ import java.util.Map;
  * <p>Each layer is written as soon as the next one begins, and the encoder keeps its buffers for
  * the next tile, so reuse one instance per thread. Instances are not thread-safe.
  *
- * <p>Streams use the v1 encodings that need no extension: VarInt words with whichever of none,
- * delta, RLE and delta-RLE is smallest, componentwise-delta vertices, and plain or dictionary
- * strings, whichever is smaller. Output depends only on the input, so it is deterministic.
+ * <p>Every stream is stored in whichever of the encodings the options allow takes the fewest bytes.
+ * Output depends only on the input and options, so it is deterministic.
  */
 public final class MltEncoder {
 
-  private static final int LAYER_TAG = 1;
-  private static final int TYPE_ID = 0;
-  private static final int TYPE_LONG_ID = 2;
-  private static final int TYPE_GEOMETRY = 4;
-  private static final int PRESENT_STREAM = 0x00;
-  private static final int DATA_STREAM = 0x10;
-
   /**
    * The size of one layer of the last encoded tile: {@code bytes} for the whole layer frame, and
-   * {@code propertyBytes} for the metadata and data of its property columns.
+   * {@code propertyBytes} for its property columns.
    */
   public record LayerSize(String name, int bytes, int propertyBytes) {}
 
+  /** What the writers may do, as {@link Builder} sets it. */
+  record Options(
+      MltVersion version,
+      boolean fastPfor,
+      boolean fsst,
+      SharedDictionaries sharedDictionaries,
+      List<FeatureOrder> featureOrders,
+      Tessellation tessellation) {}
+
+  private final Options options;
+  private final LayerWriter writer;
+  private final Layer layer = new Layer();
   private final ByteWriter tile = new ByteWriter();
-  private final ByteWriter meta = new ByteWriter();
-  private final ByteWriter data = new ByteWriter();
-  private final Codecs codecs;
-  private final GeometryColumn geometry;
-  private final LongList ids = new LongList();
-  private final BooleanStream idPresent = new BooleanStream();
-  private final Map<String, Integer> keys = new HashMap<>();
-  private final List<PropertyColumn> columns = new ArrayList<>();
   private final List<LayerSize> layerSizes = new ArrayList<>();
   private List<LayerSize> lastLayerSizes = List.of();
-  private String layerName;
-  private int extent;
-  private int featureCount;
-  private boolean idsFitIn32Bits = true;
+  private boolean inLayer;
 
-  /** Encodings an encoder may use beyond the ones every v1 decoder must support. */
-  public enum OptionalEncoding {
-    /** SIMD-FastPFOR words for integer and vertex streams of 256 values or more, where smaller. */
-    FASTPFOR,
-    /** FSST-compressed string dictionaries, where smaller. */
-    FSST
+  /** The features the last {@code addFeature} call added, which properties are set on. */
+  private int firstFeatureOfLastAdd;
+
+  // Two buffers to write a layer in each feature order to, keeping the smallest.
+  private ByteWriter trial = new ByteWriter();
+  private ByteWriter smallestTrial = new ByteWriter();
+
+  /** Creates an encoder with the default options: MLT v1, with only the encodings v1 requires. */
+  public MltEncoder() {
+    this(builder().options());
   }
 
-  /**
-   * Creates an encoder that may also use {@code encodings}. Its buffers grow to the largest tile it
-   * encodes.
-   */
-  public MltEncoder(OptionalEncoding... encodings) {
-    var enabled = List.of(encodings);
-    codecs =
-        new Codecs(
-            enabled.contains(OptionalEncoding.FASTPFOR), enabled.contains(OptionalEncoding.FSST));
-    geometry = new GeometryColumn(codecs);
+  private MltEncoder(Options options) {
+    this.options = options;
+    var codecs = new Codecs(options.fastPfor(), options.fsst());
+    this.writer =
+        options.version() == MltVersion.V1
+            ? new V1LayerWriter(options, codecs)
+            : new V2LayerWriter(options, codecs);
+  }
+
+  /** Returns a builder that starts from the default options. */
+  public static Builder builder() {
+    return new Builder();
   }
 
   /**
    * Starts a new layer, which the following features go into.
    *
-   * @throws IllegalArgumentException if the name is empty or the extent is not positive
+   * @throws IllegalArgumentException if the name is empty or the extent is not positive, or for v2
+   *     not a power of two from 64 to 2097152
    */
   public void beginLayer(String name, int extent) {
     if (name.isEmpty() || extent <= 0) {
       throw new IllegalArgumentException("invalid layer name '" + name + "' or extent " + extent);
     }
+    if (options.version() == MltVersion.V2) {
+      V2LayerWriter.extentCode(extent);
+    }
     finishLayer();
-    this.layerName = name;
-    this.extent = extent;
+    layer.begin(name, extent);
+    inLayer = true;
   }
 
   /** Returns the key to set property {@code name} of features in the current layer with. */
   public int propertyKey(String name) {
     requireLayer();
-    Integer key = keys.get(name);
-    if (key == null) {
-      key = columns.size();
-      keys.put(name, key);
-      columns.add(new PropertyColumn(name));
-    }
-    return key;
+    return layer.propertyKey(name);
   }
 
   /**
@@ -111,9 +108,8 @@ public final class MltEncoder {
    */
   public void addFeature(MvtGeometryType type, int[] commands) {
     requireLayer();
-    geometry.add(type, commands);
-    idPresent.add(false);
-    featureCount++;
+    firstFeatureOfLastAdd = layer.featureCount();
+    MvtCommands.add(type, commands, layer.geometries);
   }
 
   /**
@@ -122,12 +118,41 @@ public final class MltEncoder {
    * @see #addFeature(MvtGeometryType, int[])
    */
   public void addFeature(MvtGeometryType type, int[] commands, long id) {
+    addFeature(type, commands);
+    layer.ids.add(firstFeatureOfLastAdd, id);
+  }
+
+  /**
+   * Adds a feature without an id to the current layer from a JTS geometry in tile coordinates,
+   * which are rounded to the nearest integer. Polygon rings are rewound as MLT requires. A geometry
+   * collection that mixes points, lines and polygons becomes one feature per kind, and the next
+   * {@link #setProperty} calls set the properties of each.
+   *
+   * @throws IllegalArgumentException if the geometry is empty, in which case no feature is added
+   */
+  public void addFeature(Geometry geometry) {
     requireLayer();
-    geometry.add(type, commands);
-    ids.add(id);
-    idPresent.add(true);
-    idsFitIn32Bits &= (id >>> 32) == 0;
-    featureCount++;
+    List<Geometry> features = JtsGeometries.features(geometry);
+    if (features.isEmpty()) {
+      throw new IllegalArgumentException("geometry has no vertices");
+    }
+    int featureCountBefore = layer.featureCount();
+    for (Geometry feature : features) {
+      JtsGeometries.add(feature, layer.geometries);
+    }
+    firstFeatureOfLastAdd = featureCountBefore;
+  }
+
+  /**
+   * Adds a feature with an id (read as unsigned) to the current layer from a JTS geometry.
+   *
+   * @see #addFeature(Geometry)
+   */
+  public void addFeature(Geometry geometry, long id) {
+    addFeature(geometry);
+    for (int f = firstFeatureOfLastAdd; f < layer.featureCount(); f++) {
+      layer.ids.add(f, id);
+    }
   }
 
   /**
@@ -136,10 +161,13 @@ public final class MltEncoder {
    * stored as their {@link String#valueOf string}, and {@code null} leaves the property unset.
    */
   public void setProperty(int key, Object value) {
-    if (featureCount == 0) {
+    if (layer.featureCount() == 0) {
       throw new IllegalStateException("no feature to set a property on");
     }
-    columns.get(key).set(featureCount - 1, value);
+    PropertyColumn column = layer.columns.get(key);
+    for (int f = firstFeatureOfLastAdd; f < layer.featureCount(); f++) {
+      column.set(f, value);
+    }
   }
 
   /** Sets a property of the latest feature by name, see {@link #setProperty(int, Object)}. */
@@ -163,65 +191,114 @@ public final class MltEncoder {
   }
 
   private void requireLayer() {
-    if (layerName == null) {
+    if (!inLayer) {
       throw new IllegalStateException("no layer, call beginLayer first");
     }
   }
 
-  /** Appends the current layer to the tile, unless it has no features, and clears it. */
+  /** Appends the current layer to the tile, unless it has no features. */
   private void finishLayer() {
-    if (featureCount > 0) {
+    if (inLayer && layer.featureCount() > 0) {
       writeLayer();
     }
-    layerName = null;
-    featureCount = 0;
-    geometry.clear();
-    ids.clear();
-    idPresent.clear();
-    idsFitIn32Bits = true;
-    keys.clear();
-    columns.clear();
+    inLayer = false;
   }
 
   private void writeLayer() {
-    meta.clear();
-    data.clear();
-    int columnCount = 1 + columns.size();
-    if (ids.size() > 0) {
-      columnCount++;
-      boolean nullable = ids.size() < featureCount;
-      int type = idsFitIn32Bits ? TYPE_ID : TYPE_LONG_ID;
-      meta.writeByte(nullable ? type + 1 : type);
-      if (nullable) {
-        idPresent.writeTo(data, PRESENT_STREAM);
+    List<FeatureOrder> orders = options.featureOrders();
+    if (orders.size() == 1) {
+      layerSizes.add(writer.write(layer.reordered(orders.getFirst()), tile));
+      return;
+    }
+    // Writes the layer in each order and keeps the smallest, the first on a tie.
+    LayerSize smallest = null;
+    for (FeatureOrder order : orders) {
+      trial.clear();
+      LayerSize size = writer.write(layer.reordered(order), trial);
+      if (smallest == null || size.bytes() < smallest.bytes()) {
+        smallest = size;
+        var swap = smallestTrial;
+        smallestTrial = trial;
+        trial = swap;
       }
-      IntegerStream.of(ids, false, !idsFitIn32Bits, codecs).writeTo(data, DATA_STREAM);
     }
-    meta.writeByte(TYPE_GEOMETRY);
-    geometry.writeTo(data);
-    int beforeProperties = meta.size() + data.size();
-    for (PropertyColumn column : columns) {
-      column.writeTo(meta, data, featureCount, codecs);
-    }
-    int propertyBytes = meta.size() + data.size() - beforeProperties;
+    tile.writeBytes(smallestTrial);
+    layerSizes.add(smallest);
+  }
 
-    byte[] name = layerName.getBytes(StandardCharsets.UTF_8);
-    int frameSize =
-        1
-            + ByteWriter.varintSize(name.length)
-            + name.length
-            + ByteWriter.varintSize(extent)
-            + ByteWriter.varintSize(columnCount)
-            + meta.size()
-            + data.size();
-    int start = tile.size();
-    tile.writeVarint(frameSize);
-    tile.writeByte(LAYER_TAG);
-    tile.writeString(name);
-    tile.writeVarint(extent);
-    tile.writeVarint(columnCount);
-    tile.writeBytes(meta);
-    tile.writeBytes(data);
-    layerSizes.add(new LayerSize(layerName, tile.size() - start, propertyBytes));
+  /**
+   * Sets the options of an {@link MltEncoder}; each defaults to what {@code new MltEncoder()} uses.
+   */
+  public static final class Builder {
+    private MltVersion version = MltVersion.V1;
+    private boolean fastPfor;
+    private boolean fsst;
+    private SharedDictionaries sharedDictionaries = SharedDictionaries.NONE;
+    private List<FeatureOrder> featureOrders = List.of(FeatureOrder.INPUT);
+    private Tessellation tessellation = Tessellation.NONE;
+
+    private Builder() {}
+
+    /** The MLT version to write. Default {@link MltVersion#V1}. */
+    public Builder version(MltVersion version) {
+      this.version = Objects.requireNonNull(version);
+      return this;
+    }
+
+    /**
+     * Whether integer and vertex streams may use FastPFOR, where it is smaller. Default false:
+     * every decoder must support it, but it makes gzip-compressed tiles larger.
+     */
+    public Builder fastPfor(boolean fastPfor) {
+      this.fastPfor = fastPfor;
+      return this;
+    }
+
+    /**
+     * Whether string dictionaries of 2 KB or more may be compressed with FSST, where it is smaller.
+     * Default false: every decoder must support it, but it makes gzip-compressed tiles larger.
+     */
+    public Builder fsst(boolean fsst) {
+      this.fsst = fsst;
+      return this;
+    }
+
+    /**
+     * Which string columns of a layer share one dictionary. Default {@link
+     * SharedDictionaries#NONE}.
+     */
+    public Builder sharedDictionaries(SharedDictionaries sharedDictionaries) {
+      this.sharedDictionaries = Objects.requireNonNull(sharedDictionaries);
+      return this;
+    }
+
+    /**
+     * The orders to try writing each layer's features in: the encoder writes the layer in each and
+     * keeps the smallest, so every extra order costs another write of the layer. Default {@link
+     * FeatureOrder#INPUT} only.
+     *
+     * @throws IllegalArgumentException if no order is given
+     */
+    public Builder featureOrders(FeatureOrder... featureOrders) {
+      if (featureOrders.length == 0) {
+        throw new IllegalArgumentException("no feature order");
+      }
+      this.featureOrders = List.of(featureOrders);
+      return this;
+    }
+
+    /** Whether to store polygons pre-cut into triangles. Default {@link Tessellation#NONE}. */
+    public Builder tessellation(Tessellation tessellation) {
+      this.tessellation = Objects.requireNonNull(tessellation);
+      return this;
+    }
+
+    public MltEncoder build() {
+      return new MltEncoder(options());
+    }
+
+    private Options options() {
+      return new Options(version, fastPfor, fsst, sharedDictionaries, featureOrders, tessellation);
+    }
   }
 }

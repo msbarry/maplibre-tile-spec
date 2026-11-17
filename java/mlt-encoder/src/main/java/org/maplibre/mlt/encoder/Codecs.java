@@ -3,29 +3,48 @@ package org.maplibre.mlt.encoder;
 import org.maplibre.mlt.converter.encodings.fsst.SymbolTableBuilder;
 
 /**
- * The optional codecs an encoder may use, and scratch buffers that columns use while they are
- * written, shared so each tile reuses them.
+ * The optional codecs an encoder may use. Each holds tables of about 1 MB or more, so it is only
+ * created the first time a stream is large enough to try it, and then reused for every tile.
  */
 final class Codecs {
 
-  /** FastPFOR, or null when it is disabled. */
-  final FastPfor fastPfor;
+  private final boolean fastPforEnabled;
+  private final boolean fsstEnabled;
+  private V1FastPfor v1FastPfor;
+  private V2FastPfor v2FastPfor;
+  private SymbolTableBuilder fsst;
 
-  /** FSST, or null when it is disabled. */
-  final SymbolTableBuilder fsst;
-
-  final BooleanStream booleans = new BooleanStream();
-  private final LongList[] longs = {new LongList(), new LongList(), new LongList(), new LongList()};
-
-  Codecs(boolean fastPfor, boolean fsst) {
-    this.fastPfor = fastPfor ? new FastPfor() : null;
-    this.fsst = fsst ? new SymbolTableBuilder() : null;
+  Codecs(boolean fastPforEnabled, boolean fsstEnabled) {
+    this.fastPforEnabled = fastPforEnabled;
+    this.fsstEnabled = fsstEnabled;
   }
 
-  /** Returns scratch list {@code index}, emptied. */
-  LongList longs(int index) {
-    LongList list = longs[index];
-    list.clear();
-    return list;
+  boolean fastPforEnabled() {
+    return fastPforEnabled;
+  }
+
+  V1FastPfor v1FastPfor() {
+    if (v1FastPfor == null) {
+      v1FastPfor = new V1FastPfor();
+    }
+    return v1FastPfor;
+  }
+
+  V2FastPfor v2FastPfor() {
+    if (v2FastPfor == null) {
+      v2FastPfor = new V2FastPfor();
+    }
+    return v2FastPfor;
+  }
+
+  boolean fsstEnabled() {
+    return fsstEnabled;
+  }
+
+  SymbolTableBuilder fsst() {
+    if (fsst == null) {
+      fsst = new SymbolTableBuilder();
+    }
+    return fsst;
   }
 }

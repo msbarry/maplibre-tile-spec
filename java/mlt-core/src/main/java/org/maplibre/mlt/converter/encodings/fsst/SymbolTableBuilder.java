@@ -31,6 +31,9 @@ public final class SymbolTableBuilder {
   /** Bytes past the end of the input that the symbol lookup reads. */
   private static final int PADDING = 8;
 
+  // Reads the 8 bytes at any offset of a byte array as one long in a single load. Little-endian
+  // puts the first byte in the low bits, so masking with (1L << 8 * length) - 1 keeps exactly the
+  // first length bytes, which matches a symbol of that length in one compare.
   private static final VarHandle LONG_LE =
       MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
 

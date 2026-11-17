@@ -9,7 +9,7 @@ class MltEncoderFsstTest extends MltEncoderTest {
 
   @Override
   MltEncoder newEncoder() {
-    return new MltEncoder(MltEncoder.OptionalEncoding.FSST);
+    return MltEncoder.builder().fsst(true).build();
   }
 
   @Test

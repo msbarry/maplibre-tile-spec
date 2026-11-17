@@ -3,6 +3,7 @@ package org.maplibre.mlt.encoder;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -11,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
+import org.locationtech.jts.io.WKTReader;
 import org.maplibre.mlt.data.Feature;
 import org.maplibre.mlt.data.Layer;
 import org.maplibre.mlt.decoder.MltDecoder;
@@ -279,6 +281,134 @@ class MltEncoderTest {
     assertEquals(
         List.of(EVERY_GEOMETRY_TYPE.get(0), EVERY_GEOMETRY_TYPE.get(1)),
         decodeLayer(encoder.encode(), "layer"));
+  }
+
+  @Test
+  void jtsGeometries() throws Exception {
+    var wkt = new WKTReader();
+    encoder.beginLayer("layer", 4096);
+    for (String expected : EVERY_GEOMETRY_TYPE) {
+      encoder.addFeature(wkt.read(expected.substring(2, expected.length() - 3)));
+    }
+    assertEquals(EVERY_GEOMETRY_TYPE, decodeLayer(encoder.encode(), "layer"));
+  }
+
+  @Test
+  void jtsPolygonsAreRewound() throws Exception {
+    var wkt = new WKTReader();
+    encoder.beginLayer("layer", 4096);
+    for (String expected : EVERY_GEOMETRY_TYPE.subList(4, 6)) {
+      encoder.addFeature(wkt.read(expected.substring(2, expected.length() - 3)).reverse());
+    }
+    String rewound = decodeLayer(encoder.encode(), "layer").toString();
+    // The same rings as the originals, winding the same way, each starting at another vertex.
+    assertEquals(
+        "[- POLYGON ((10 0, 10 10, 0 10, 0 0, 10 0), (2 4, 4 4, 4 2, 2 2, 2 4)) {}, "
+            + "- MULTIPOLYGON (((10 0, 10 10, 0 10, 0 0, 10 0), (2 4, 4 4, 4 2, 2 2, 2 4)), "
+            + "((30 20, 30 30, 20 20, 30 20))) {}]",
+        rewound);
+  }
+
+  @Test
+  void jtsCollectionOfMixedKindsIsOneFeaturePerKind() throws Exception {
+    encoder.beginLayer("layer", 4096);
+    encoder.addFeature(
+        new WKTReader().read("GEOMETRYCOLLECTION (POINT (1.4 2.6), LINESTRING (0 0, 10 0))"), 5);
+    encoder.setProperty("kind", "mixed");
+    assertEquals(
+        List.of(
+            "5 MULTIPOINT ((1 3)) {kind=mixed}", "5 MULTILINESTRING ((0 0, 10 0)) {kind=mixed}"),
+        decodeLayer(encoder.encode(), "layer"));
+  }
+
+  @Test
+  void featuresSortedById() throws IOException {
+    var sorted = MltEncoder.builder().featureOrders(FeatureOrder.ID).build();
+    sorted.beginLayer("layer", 4096);
+    for (long id : new long[] {3, 1, 2}) {
+      sorted.addFeature(MvtGeometryType.POINT, new Commands().moveTo((int) id, 0).build(), id);
+      sorted.setProperty("id", id);
+    }
+    sorted.addFeature(MvtGeometryType.POINT, new Commands().moveTo(9, 9).build());
+    assertEquals(
+        List.of(
+            "1 POINT (1 0) {id=1}",
+            "2 POINT (2 0) {id=2}",
+            "3 POINT (3 0) {id=3}",
+            "- POINT (9 9) {}"),
+        decodeLayer(sorted.encode(), "layer"));
+  }
+
+  @Test
+  void featuresSortedAlongHilbertCurveKeepTheirValues() throws IOException {
+    var sorted = MltEncoder.builder().featureOrders(FeatureOrder.HILBERT).build();
+    List<String> expected = addLargeLayer(sorted);
+    List<String> actual = decodeLayer(sorted.encode(), "large");
+    assertEquals(expected.stream().sorted().toList(), actual.stream().sorted().toList());
+  }
+
+  @Test
+  void smallestOfSeveralOrdersIsKept() {
+    var unsorted = MltEncoder.builder().build();
+    addLargeLayer(unsorted);
+    var trial =
+        MltEncoder.builder().featureOrders(FeatureOrder.INPUT, FeatureOrder.HILBERT).build();
+    addLargeLayer(trial);
+    assertTrue(trial.encode().length <= unsorted.encode().length);
+  }
+
+  @Test
+  void sharedDictionaryPerLayer() throws IOException {
+    var shared = MltEncoder.builder().sharedDictionaries(SharedDictionaries.PER_LAYER).build();
+    List<String> expected = addTranslatedNames(shared);
+    byte[] tile = shared.encode();
+    assertEquals(expected, decodeLayer(tile, "places"));
+    var separate = new MltEncoder();
+    addTranslatedNames(separate);
+    assertTrue(tile.length < separate.encode().length);
+  }
+
+  /** Adds name columns that mostly repeat each other, as translations of place names do. */
+  private static List<String> addTranslatedNames(MltEncoder encoder) {
+    encoder.beginLayer("places", 4096);
+    List<String> expected = new ArrayList<>();
+    for (int i = 0; i < 200; i++) {
+      String name = "Place number " + i;
+      String english = i % 5 == 0 ? "Place " + i + " (en)" : name;
+      encoder.addFeature(MvtGeometryType.POINT, new Commands().moveTo(i, i).build());
+      encoder.setProperty("name", name);
+      encoder.setProperty("name:en", english);
+      if (i % 3 != 0) {
+        encoder.setProperty("name:de", name);
+      }
+      expected.add(
+          "- POINT ("
+              + i
+              + " "
+              + i
+              + ") {name="
+              + name
+              + (i % 3 != 0 ? ", name:de=" + name : "")
+              + ", name:en="
+              + english
+              + "}");
+    }
+    return expected;
+  }
+
+  @Test
+  void tessellatedPolygonsDecodeToTheirRings() throws IOException {
+    var tessellating = MltEncoder.builder().tessellation(Tessellation.WITH_OUTLINES).build();
+    tessellating.beginLayer("mixed", 4096);
+    var wkt = new WKTReader();
+    for (String expected : EVERY_GEOMETRY_TYPE) {
+      try {
+        tessellating.addFeature(wkt.read(expected.substring(2, expected.length() - 3)));
+      } catch (org.locationtech.jts.io.ParseException e) {
+        throw new IllegalStateException(e);
+      }
+    }
+    assertEquals(EVERY_GEOMETRY_TYPE, decodeLayer(tessellating.encode(), "mixed"));
   }
 
   private static final List<String> EVERY_GEOMETRY_TYPE =

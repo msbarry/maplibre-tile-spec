@@ -1,13 +1,13 @@
 package org.maplibre.mlt.encoder;
 
 /**
- * An integer stream stored with whichever v1 encoding takes the fewest bytes: none, delta, RLE or
- * delta-RLE as VarInt words, or, when enabled, none or delta as FastPFOR words.
+ * An MLT v1 integer stream stored with whichever encoding takes the fewest bytes: none, delta, RLE
+ * or delta-RLE as VarInt words, or, when enabled, none or delta as FastPFOR words.
  *
  * <p>The size of every candidate is computed exactly without writing it, so nothing is encoded
  * twice to compare them.
  */
-final class IntegerStream {
+final class V1IntegerStream {
 
   private static final int VARINT = 0b10;
   private static final int FASTPFOR = 0b01;
@@ -37,7 +37,7 @@ final class IntegerStream {
   private final LongList values;
   private final boolean signed;
   private final boolean wide;
-  private final FastPfor fastPfor;
+  private final Codecs codecs;
   private Logical logical;
   private int payloadBytes;
   private int runs;
@@ -49,12 +49,12 @@ final class IntegerStream {
    * Plans the stream of {@code values}: {@code signed} values get zigzag-encoded, and {@code wide}
    * streams have 64-bit words (deltas of the others wrap at 32 bits, as decoders compute them).
    */
-  static IntegerStream of(LongList values, boolean signed, boolean wide, Codecs codecs) {
-    return new IntegerStream(values, signed, wide, codecs.fastPfor);
+  static V1IntegerStream of(LongList values, boolean signed, boolean wide, Codecs codecs) {
+    return new V1IntegerStream(values, signed, wide, codecs);
   }
 
-  private IntegerStream(LongList values, boolean signed, boolean wide, FastPfor fastPfor) {
-    this.fastPfor = fastPfor;
+  private V1IntegerStream(LongList values, boolean signed, boolean wide, Codecs codecs) {
+    this.codecs = codecs;
     this.values = values;
     this.signed = signed;
     this.wide = wide;
@@ -79,7 +79,7 @@ final class IntegerStream {
     consider(Logical.RLE, valueRuns.payloadBytes(), valueRuns.runs);
     consider(Logical.DELTA_RLE, deltaRuns.payloadBytes(), deltaRuns.runs);
     // FastPFOR needs the words as 32-bit ints, so only materialize them where it can win.
-    if (fastPfor != null && !wide && values.size() >= FastPfor.MIN_VALUES) {
+    if (codecs.fastPforEnabled() && !wide && values.size() >= V1FastPfor.MIN_VALUES) {
       considerFastPfor(Logical.NONE);
       considerFastPfor(Logical.DELTA);
     }
@@ -102,7 +102,7 @@ final class IntegerStream {
     for (int i = 0; i < words.length; i++) {
       words[i] = (int) word(i, candidate.isDelta());
     }
-    int[] encoded = fastPfor.encode(words, words.length);
+    int[] encoded = codecs.v1FastPfor().encode(words, words.length);
     int bytes = 4 * encoded.length;
     if (streamSize(candidate, bytes, 0, words.length) < size()) {
       logical = candidate;
@@ -124,7 +124,7 @@ final class IntegerStream {
     if (fastPforWords != null) {
       out.writeVarint(count);
       out.writeVarint(payloadBytes);
-      FastPfor.write(out, fastPforWords);
+      V1FastPfor.write(out, fastPforWords);
     } else if (logical.isRle()) {
       out.writeVarint(2L * runs);
       out.writeVarint(payloadBytes);

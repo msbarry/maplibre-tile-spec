@@ -11,9 +11,13 @@ repositories {
 }
 
 dependencies {
+    // JTS geometries are part of the API: MltEncoder.addFeature takes them.
+    api(libs.jts.core)
     implementation project(':mlt-core')
+    implementation(libs.earcut4j)
     implementation(libs.javaFastPFOR)
-    testImplementation(libs.jts.core)
+    testImplementation(libs.jts.io.common)
+    testImplementation(libs.gson)
     testImplementation(libs.junit.jupiter.api)
     testImplementation(libs.junit.jupiter.params)
     testRuntimeOnly(libs.junit.jupiter.engine)

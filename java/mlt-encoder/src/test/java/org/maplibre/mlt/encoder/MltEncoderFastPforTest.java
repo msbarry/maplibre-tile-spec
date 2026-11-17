@@ -9,7 +9,7 @@ class MltEncoderFastPforTest extends MltEncoderTest {
 
   @Override
   MltEncoder newEncoder() {
-    return new MltEncoder(MltEncoder.OptionalEncoding.FASTPFOR);
+    return MltEncoder.builder().fastPfor(true).build();
   }
 
   @Test

@@ -1,18 +1,23 @@
 package org.maplibre.mlt.encoder;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import org.maplibre.mlt.converter.encodings.fsst.SymbolTable;
 
 /**
- * The values of one property key in a layer. The column type is picked from the values once the
- * layer is complete: booleans, integers (32 or 64-bit), floats or doubles when every value has that
- * type, doubles for a mix of numbers, and strings for anything else.
+ * The values of one property key in a layer, independent of the MLT version it is written to. The
+ * column's {@link ValueType} is picked from the values once the layer is complete.
  */
 final class PropertyColumn {
+
+  /** The type a column is stored as. */
+  enum ValueType {
+    BOOL,
+    INT32,
+    INT64,
+    FLOAT,
+    DOUBLE,
+    STRING
+  }
 
   private static final int BOOL = 1;
   private static final int INT = 2;
@@ -20,30 +25,8 @@ final class PropertyColumn {
   private static final int DOUBLE = 8;
   private static final int STRING = 16;
 
-  private static final int TYPE_BOOL = 10;
-  private static final int TYPE_INT32 = 16;
-  private static final int TYPE_INT64 = 20;
-  private static final int TYPE_FLOAT = 24;
-  private static final int TYPE_DOUBLE = 26;
-  private static final int TYPE_STRING = 28;
-
-  private static final int PRESENT_STREAM = 0x00;
-  private static final int DATA_STREAM = 0x10;
-  private static final int DICTIONARY_DATA_STREAM = 0x11;
-  private static final int STRING_CODES_STREAM = 0x22;
-  private static final int STRING_LENGTHS_STREAM = 0x30;
-  private static final int DICTIONARY_LENGTHS_STREAM = 0x36;
-  private static final int SYMBOL_TABLE_STREAM = 0x15;
-  private static final int SYMBOL_LENGTHS_STREAM = 0x35;
-  private static final int PLAIN_ENCODING = 0;
-
-  /**
-   * FSST is only tried on dictionaries of at least this many bytes, as the Rust encoder does:
-   * training on smaller ones costs much more time than the few bytes it saves.
-   */
-  private static final int MIN_FSST_BYTES = 2048;
-
-  private final byte[] name;
+  final String name;
+  final byte[] nameUtf8;
   private int[] features = new int[16];
   private Object[] values = new Object[16];
   private int count;
@@ -52,7 +35,8 @@ final class PropertyColumn {
   private long maxInt = Long.MIN_VALUE;
 
   PropertyColumn(String name) {
-    this.name = name.getBytes(StandardCharsets.UTF_8);
+    this.name = name;
+    this.nameUtf8 = name.getBytes(StandardCharsets.UTF_8);
   }
 
   /** Sets the value of {@code feature}, which must be the latest feature that got one. */
@@ -77,183 +61,70 @@ final class PropertyColumn {
     values[count++] = value;
   }
 
-  /** Writes the column's metadata to {@code meta} and its streams to {@code data}. */
-  void writeTo(ByteWriter meta, ByteWriter data, int featureCount, Codecs codecs) {
-    int type = type();
-    boolean nullable = count < featureCount;
-    meta.writeByte(nullable ? type + 1 : type);
-    meta.writeString(name);
-    if (type == TYPE_STRING) {
-      writeStrings(data, nullable, featureCount, codecs);
-      return;
-    }
-    if (nullable) {
-      writePresent(data, featureCount, codecs.booleans);
-    }
-    switch (type) {
-      case TYPE_BOOL -> {
-        codecs.booleans.clear();
-        for (int i = 0; i < count; i++) {
-          codecs.booleans.add((Boolean) values[i]);
-        }
-        codecs.booleans.writeTo(data, DATA_STREAM);
-      }
-      case TYPE_INT32, TYPE_INT64 -> {
-        LongList ints = codecs.longs(0);
-        for (int i = 0; i < count; i++) {
-          ints.add(((Number) values[i]).longValue());
-        }
-        IntegerStream.of(ints, true, type == TYPE_INT64, codecs).writeTo(data, DATA_STREAM);
-      }
-      case TYPE_FLOAT -> {
-        writePlainHeader(data, DATA_STREAM, count, 4L * count);
-        for (int i = 0; i < count; i++) {
-          data.writeIntLE(Float.floatToRawIntBits((Float) values[i]));
-        }
-      }
-      default -> {
-        writePlainHeader(data, DATA_STREAM, count, 8L * count);
-        for (int i = 0; i < count; i++) {
-          data.writeLongLE(Double.doubleToRawLongBits(((Number) values[i]).doubleValue()));
-        }
-      }
-    }
-  }
-
-  private int type() {
-    if (kinds == BOOL) {
-      return TYPE_BOOL;
-    } else if (kinds == INT) {
-      return minInt >= Integer.MIN_VALUE && maxInt <= Integer.MAX_VALUE ? TYPE_INT32 : TYPE_INT64;
-    } else if (kinds == FLOAT) {
-      return TYPE_FLOAT;
-    } else if ((kinds & ~(INT | FLOAT | DOUBLE)) == 0) {
-      return TYPE_DOUBLE;
-    }
-    return TYPE_STRING;
-  }
-
   /**
-   * Writes the plain layout (each value's bytes) or the dictionary layout (each distinct value
-   * once, plus a code per value), whichever is smaller.
+   * Booleans, integers (32 or 64-bit), floats or doubles when every value has that type, doubles
+   * for a mix of numbers, and strings for anything else.
    */
-  private void writeStrings(ByteWriter data, boolean nullable, int featureCount, Codecs codecs) {
-    var codesByValue = new HashMap<String, Integer>();
-    List<byte[]> dictionary = new ArrayList<>();
-    LongList codes = codecs.longs(0);
-    LongList plainLengths = codecs.longs(1);
-    LongList dictionaryLengths = codecs.longs(2);
-    long plainBytes = 0;
-    long dictionaryBytes = 0;
-    for (int i = 0; i < count; i++) {
-      String value = values[i] instanceof String string ? string : String.valueOf(values[i]);
-      Integer code = codesByValue.get(value);
-      if (code == null) {
-        code = dictionary.size();
-        codesByValue.put(value, code);
-        byte[] utf8 = value.getBytes(StandardCharsets.UTF_8);
-        dictionary.add(utf8);
-        dictionaryLengths.add(utf8.length);
-        dictionaryBytes += utf8.length;
-      }
-      int length = dictionary.get(code).length;
-      codes.add(code);
-      plainLengths.add(length);
-      plainBytes += length;
+  ValueType valueType() {
+    if (kinds == BOOL) {
+      return ValueType.BOOL;
+    } else if (kinds == INT) {
+      return minInt >= Integer.MIN_VALUE && maxInt <= Integer.MAX_VALUE
+          ? ValueType.INT32
+          : ValueType.INT64;
+    } else if (kinds == FLOAT) {
+      return ValueType.FLOAT;
+    } else if ((kinds & ~(INT | FLOAT | DOUBLE)) == 0) {
+      return ValueType.DOUBLE;
     }
-    var plainLengthsStream = IntegerStream.of(plainLengths, false, false, codecs);
-    var dictionaryLengthsStream = IntegerStream.of(dictionaryLengths, false, false, codecs);
-    var codesStream = IntegerStream.of(codes, false, false, codecs);
-    long plainSize = plainLengthsStream.size() + dataStreamSize(count, plainBytes);
-    long dictionarySize =
-        dictionaryLengthsStream.size()
-            + codesStream.size()
-            + dataStreamSize(dictionary.size(), dictionaryBytes);
-    IntegerStream symbolLengthsStream = null;
-    SymbolTable fsst = null;
-    long fsstSize = Long.MAX_VALUE;
-    if (codecs.fsst != null && dictionaryBytes >= MIN_FSST_BYTES) {
-      byte[] text = new byte[(int) dictionaryBytes];
-      int position = 0;
-      for (byte[] utf8 : dictionary) {
-        System.arraycopy(utf8, 0, text, position, utf8.length);
-        position += utf8.length;
-      }
-      fsst = codecs.fsst.encode(text);
-      LongList symbolLengths = codecs.longs(3);
-      for (int length : fsst.symbolLengths()) {
-        symbolLengths.add(length);
-      }
-      symbolLengthsStream = IntegerStream.of(symbolLengths, false, false, codecs);
-      fsstSize =
-          symbolLengthsStream.size()
-              + dataStreamSize(fsst.symbolLengths().length, fsst.symbols().length)
-              + dictionaryLengthsStream.size()
-              + dataStreamSize(dictionary.size(), fsst.compressedData().length)
-              + codesStream.size();
-    }
-
-    if (fsstSize < Math.min(plainSize, dictionarySize)) {
-      data.writeVarint((nullable ? 1 : 0) + 5);
-      if (nullable) {
-        writePresent(data, featureCount, codecs.booleans);
-      }
-      symbolLengthsStream.writeTo(data, SYMBOL_LENGTHS_STREAM);
-      writePlainHeader(
-          data, SYMBOL_TABLE_STREAM, fsst.symbolLengths().length, fsst.symbols().length);
-      data.writeBytes(fsst.symbols());
-      dictionaryLengthsStream.writeTo(data, DICTIONARY_LENGTHS_STREAM);
-      writePlainHeader(
-          data, DICTIONARY_DATA_STREAM, dictionary.size(), fsst.compressedData().length);
-      data.writeBytes(fsst.compressedData());
-      codesStream.writeTo(data, STRING_CODES_STREAM);
-    } else if (dictionarySize < plainSize) {
-      data.writeVarint((nullable ? 1 : 0) + 3);
-      if (nullable) {
-        writePresent(data, featureCount, codecs.booleans);
-      }
-      dictionaryLengthsStream.writeTo(data, DICTIONARY_LENGTHS_STREAM);
-      codesStream.writeTo(data, STRING_CODES_STREAM);
-      writePlainHeader(data, DICTIONARY_DATA_STREAM, dictionary.size(), dictionaryBytes);
-      for (byte[] utf8 : dictionary) {
-        data.writeBytes(utf8);
-      }
-    } else {
-      data.writeVarint((nullable ? 1 : 0) + 2);
-      if (nullable) {
-        writePresent(data, featureCount, codecs.booleans);
-      }
-      plainLengthsStream.writeTo(data, STRING_LENGTHS_STREAM);
-      writePlainHeader(data, DATA_STREAM, count, plainBytes);
-      for (int i = 0; i < count; i++) {
-        data.writeBytes(dictionary.get((int) codes.get(i)));
-      }
-    }
+    return ValueType.STRING;
   }
 
-  private static long dataStreamSize(int valueCount, long byteLength) {
-    return 2 + ByteWriter.varintSize(valueCount) + ByteWriter.varintSize(byteLength) + byteLength;
+  /** The number of features with a value. */
+  int count() {
+    return count;
   }
 
-  private void writePresent(ByteWriter data, int featureCount, BooleanStream present) {
-    present.clear();
+  Object value(int index) {
+    return values[index];
+  }
+
+  String stringValue(int index) {
+    return values[index] instanceof String string ? string : String.valueOf(values[index]);
+  }
+
+  /** Sets bit {@code f} of {@code out} for each of the layer's features that has a value. */
+  void presence(int featureCount, Bits out) {
+    out.clear();
     int next = 0;
-    for (int feature = 0; feature < featureCount; feature++) {
-      boolean isPresent = next < count && features[next] == feature;
-      if (isPresent) {
+    for (int f = 0; f < featureCount; f++) {
+      boolean present = next < count && features[next] == f;
+      if (present) {
         next++;
       }
-      present.add(isPresent);
+      out.add(present);
     }
-    present.writeTo(data, PRESENT_STREAM);
   }
 
-  private static void writePlainHeader(
-      ByteWriter data, int streamType, int valueCount, long byteLength) {
-    data.writeByte(streamType);
-    data.writeByte(PLAIN_ENCODING);
-    data.writeVarint(valueCount);
-    data.writeVarint(byteLength);
+  /** Returns a copy with the values of feature {@code f} moved to feature {@code newIndex[f]}. */
+  PropertyColumn reordered(int[] newIndex) {
+    var copy = new PropertyColumn(name);
+    copy.kinds = kinds;
+    copy.minInt = minInt;
+    copy.maxInt = maxInt;
+    copy.count = count;
+    copy.features = new int[count];
+    copy.values = new Object[count];
+    long[] byNewIndex = new long[count];
+    for (int i = 0; i < count; i++) {
+      byNewIndex[i] = ((long) newIndex[features[i]] << 32) | i;
+    }
+    Arrays.sort(byNewIndex);
+    for (int i = 0; i < count; i++) {
+      copy.features[i] = (int) (byNewIndex[i] >>> 32);
+      copy.values[i] = values[(int) byNewIndex[i]];
+    }
+    return copy;
   }
 
   private static int kindOf(Object value) {
