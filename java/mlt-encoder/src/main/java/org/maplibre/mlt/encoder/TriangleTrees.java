@@ -64,6 +64,9 @@ final class TriangleTrees {
   }
 
   /** Whether side {@code a} starts at a smaller vertex than {@code b}, or runs on to the next. */
+  // An outline passes through a vertex more than once where the tree touches itself there, so
+  // several sides can start at the smallest vertex. Preferring the one to the vertex after it
+  // breaks the tie the way the Rust reference encoder does, so both write the same cycles.
   private boolean startsEarlier(int a, int b) {
     int fromA = indices[a];
     int fromB = indices[b];

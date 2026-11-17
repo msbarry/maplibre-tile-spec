@@ -50,6 +50,8 @@ final class IdColumn {
 
   /** Returns a copy with the id of feature {@code f} moved to feature {@code newIndex[f]}. */
   IdColumn reordered(int[] newIndex) {
+    // Each entry packs the new index above the old one, so sorting primitive longs orders the ids
+    // by new index without boxing, and the low half says where each id came from.
     long[] byNewIndex = new long[count()];
     for (int i = 0; i < count(); i++) {
       byNewIndex[i] = ((long) newIndex[features.get(i)] << 32) | i;

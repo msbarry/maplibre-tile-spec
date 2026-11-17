@@ -115,6 +115,8 @@ final class PropertyColumn {
     copy.count = count;
     copy.features = new int[count];
     copy.values = new Object[count];
+    // Each entry packs the new index above the old one, so sorting primitive longs orders the
+    // values by new index without boxing, and the low half says where each value came from.
     long[] byNewIndex = new long[count];
     for (int i = 0; i < count; i++) {
       byNewIndex[i] = ((long) newIndex[features[i]] << 32) | i;

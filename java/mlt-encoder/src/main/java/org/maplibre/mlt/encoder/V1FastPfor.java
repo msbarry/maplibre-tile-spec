@@ -18,8 +18,6 @@ final class V1FastPfor {
   /** Below this many values there is no whole block, so VarInt words are always smaller. */
   static final int MIN_VALUES = 256;
 
-  private static final int PAGE = 65536;
-
   // JavaFastPFOR allocates direct buffers by default: VariableByte one per call, which the JDK
   // frees through a global lock that serializes encoders at high thread counts.
   private final IntegerCODEC codec =
@@ -48,37 +46,7 @@ final class V1FastPfor {
     }
     var outputPosition = new IntWrapper(0);
     codec.compress(words, new IntWrapper(0), count, encoded, outputPosition);
-    clearExceptionPadding(count);
     return Arrays.copyOf(encoded, outputPosition.get());
-  }
-
-  /**
-   * Zeroes the unused high bits of the last word of each exception array. JavaFastPFOR packs
-   * exceptions 32 at a time and fills those bits with values left over from earlier calls, so
-   * without this the output of a reused codec would depend on what it encoded before.
-   */
-  private void clearExceptionPadding(int count) {
-    int blockValues = count - count % MIN_VALUES;
-    // Skip FastPFOR's value count, then walk each page: its offset to the metadata, the packed
-    // blocks, the metadata byte count and bytes, a bitmap of exception widths, then per width the
-    // exception count and packed exceptions.
-    int position = 1;
-    for (int pageStart = 0; pageStart < blockValues; pageStart += PAGE) {
-      position += encoded[position];
-      int metadataBytes = encoded[position++];
-      position += (metadataBytes + 3) / 4;
-      int widths = encoded[position++];
-      for (int width = 2; width <= 32; width++) {
-        if ((widths & (1 << (width - 1))) != 0) {
-          long bits = (long) encoded[position++] * width;
-          position += (int) ((bits + 31) / 32);
-          int usedBitsInLastWord = (int) (bits % 32);
-          if (usedBitsInLastWord != 0) {
-            encoded[position - 1] &= (1 << usedBitsInLastWord) - 1;
-          }
-        }
-      }
-    }
   }
 
   static void write(ByteWriter out, int[] encoded) {

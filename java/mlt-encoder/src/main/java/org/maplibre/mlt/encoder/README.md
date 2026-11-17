@@ -160,8 +160,8 @@ What made it fast, by measured impact:
   String columns do the same across plain, dictionary, front-coded and FSST layouts.
 - **Reused buffers, lazy codecs.** Nothing is allocated per value, the output buffers grow to the largest tile
   once, and codecs that hold large tables are created on first use.
-- **Deterministic.** Output depends only on the input and the options (FastPFOR exception padding, which
-  JavaFastPFOR leaves stale between calls, is zeroed).
+- **Deterministic.** Output depends only on the input and the options. JavaFastPFOR 0.3.16 or later is
+  needed for that: earlier versions let a reused codec leave stale bits in its exception padding.
 
 ## Options
 
