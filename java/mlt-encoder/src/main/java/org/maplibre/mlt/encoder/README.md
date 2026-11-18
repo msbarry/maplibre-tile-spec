@@ -6,9 +6,10 @@ geometries, with no intermediate tile model, and picks the smallest encoding of 
 rather than by trial encoding.
 
 On every tile of a Massachusetts OpenMapTiles extract, it is 2-4x faster than the native Rust encoder with the
-same options, its output decodes with the Rust decoder to the same features, and it is up to 10% smaller and
-never more than 0.4% larger. It is about 3,100 lines of code (4,000 with comments), with no dependencies beyond
-mlt-core (FSST), JavaFastPFOR (v1 FastPFOR), earcut4j (tessellation) and JTS.
+same options, whether Rust runs from Rust or is called from Java through its FFI bindings, its output decodes
+with the Rust decoder to the same features, and it is up to 10% smaller and never more than 0.4% larger. It is
+about 3,100 lines of code (4,000 with comments), with no dependencies beyond mlt-core (FSST), JavaFastPFOR (v1
+FastPFOR), earcut4j (tessellation) and JTS.
 
 ## Usage
 
